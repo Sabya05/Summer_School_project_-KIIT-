@@ -1,18 +1,42 @@
-"""Central configuration for NewsLens AI. Loads secrets from .env — never hardcode keys."""
+"""Central configuration for NewsLens AI.
+Loads secrets from Streamlit Cloud secrets or local .env.
+Never hardcode API keys.
+"""
+
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 
-# Preferred model — swap here only if Google deprecates it.
+def get_secret(key: str) -> str:
+    """Get a secret from Streamlit Cloud or local environment."""
+
+    # Try Streamlit Cloud secrets first
+    try:
+        import streamlit as st
+
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+
+    # Fall back to local .env / environment variables
+    return os.getenv(key, "")
+
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+TAVILY_API_KEY = get_secret("TAVILY_API_KEY")
+GROQ_API_KEY = get_secret("GROQ_API_KEY")
+
+
+# Preferred Gemini model
 GEMINI_MODEL = "gemini-3.5-flash"
 
 MAX_SEARCH_RESULTS = 10
 MAX_CONTENT_LENGTH = 12000
 MAX_OUTPUT_TOKENS = 12000
+
 
 RESEARCH_MODES = {
     "quick": {
@@ -35,4 +59,12 @@ RESEARCH_MODES = {
     },
 }
 
-QUICK_TOPICS = ["AI & Technology", "World News", "Science", "Business", "Climate", "Cybersecurity"]
+
+QUICK_TOPICS = [
+    "AI & Technology",
+    "World News",
+    "Science",
+    "Business",
+    "Climate",
+    "Cybersecurity",
+]
