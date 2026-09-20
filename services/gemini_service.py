@@ -1,125 +1,82 @@
 """
-Gemini-powered synthesis of Tavily research results.
+Gemini-powered research synthesis for NewsLens AI.
 
-NewsLens AI:
-Tavily retrieves current web information.
-Gemini analyzes only the retrieved sources and creates the final synthesis.
+Gemini is the primary AI provider.
+Groq is handled separately as the fallback provider.
 """
 
 import os
 import re
 import time
 
-import streamlit as st
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from dotenv import load_dotenv
 
-from config import (
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    MAX_CONTENT_LENGTH,
-    MAX_OUTPUT_TOKENS,
-)
+from config import GEMINI_MODEL, MAX_CONTENT_LENGTH, MAX_OUTPUT_TOKENS
 from utils.text_utils import format_sources_block
 
-
-# ---------------------------------------------------------
-# Load environment variables
-# ---------------------------------------------------------
 
 load_dotenv()
 
 
-# ---------------------------------------------------------
-# Secret helper
-# ---------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 def _get_secret(key: str) -> str:
     """
-    Try Streamlit secrets first.
-    If not available, fall back to environment variables.
+    Get a secret from Streamlit Cloud secrets or local .env.
     """
 
+    # Streamlit Cloud
     try:
+        import streamlit as st
+
         if key in st.secrets:
             return st.secrets[key]
+
     except Exception:
         pass
 
+    # Local .env / environment variable
     return os.getenv(key, "")
 
 
-# Get API key safely
-API_KEY = _get_secret("GEMINI_API_KEY") or GEMINI_API_KEY
-
-
-# ---------------------------------------------------------
-# Gemini client
-# ---------------------------------------------------------
+GEMINI_API_KEY = _get_secret("GEMINI_API_KEY")
 
 _client = None
 
 
-def _get_client() -> genai.Client:
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+def _get_client():
     """
-    Create the Gemini client only when it is actually needed.
+    Create and reuse the Gemini client.
     """
 
     global _client
 
     if _client is None:
 
-        if not API_KEY:
+        if not GEMINI_API_KEY:
             raise RuntimeError(
                 "GEMINI_API_KEY is missing. "
-                "Add it to your .env file."
+                "Add it to your .env file or Streamlit secrets."
             )
 
-        _client = genai.Client(api_key=API_KEY)
+        _client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
 
     return _client
 
 
-# ---------------------------------------------------------
-# Research modes
-# ---------------------------------------------------------
-
-MODE_INSTRUCTIONS = {
-    "quick": """
-Write a QUICK BRIEF.
-Use 3-5 short paragraphs.
-Focus only on the most important facts.
-Write in the SAME LANGUAGE as the user's question.
-""",
-
-    "deep": """
-Write a DEEP RESEARCH report.
-
-Use clear sections such as:
-- What's Happening
-- Background / Context
-- Key Developments
-- Different Perspectives or Disagreement
-- Implications
-
-Translate the section headings into the user's language when appropriate.
-
-Write the entire response in the SAME LANGUAGE as the user's question.
-""",
-
-    "simple": """
-EXPLAIN SIMPLY.
-Use short sentences, everyday words, and simple explanations.
-Avoid unnecessary jargon.
-Write in the SAME LANGUAGE as the user's question.
-""",
-}
-
-
-# ---------------------------------------------------------
-# System instruction
-# ---------------------------------------------------------
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
 
 SYSTEM_PROMPT = """
 You are NewsLens AI, a careful multilingual research assistant.
@@ -137,38 +94,91 @@ IMPORTANT LANGUAGE RULE:
 
 RESEARCH RULES:
 - Base every factual claim ONLY on the numbered sources provided.
-- Cite sources inline using [1], [2], etc.
-- Never invent facts, statistics, or sources.
+- Cite sources inline using [1], [2], [3], etc.
+- Never invent facts, statistics, events, or sources.
 - If sources disagree, clearly mention the disagreement.
 - If the sources do not contain enough information, say so.
+- Do not present unsupported assumptions as facts.
 - Write clearly and naturally in the user's language.
+
+IMPORTANT:
+The retrieved context comes from a RAG pipeline.
+Use the retrieved context as the primary evidence for your answer.
 
 After the main answer, output:
 
 ###FOLLOWUPS###
 
-Then provide exactly 3 short follow-up research questions in the SAME language as the user's question.
+Then provide exactly 3 short, numbered follow-up research questions in the SAME language as the user's question.
 """
 
-# ---------------------------------------------------------
-# Temporary error detection
-# ---------------------------------------------------------
+
+# ============================================================
+# RESEARCH MODE INSTRUCTIONS
+# ============================================================
+
+MODE_INSTRUCTIONS = {
+
+    "quick": """
+Write a QUICK BRIEF.
+
+Use:
+- 3-5 short paragraphs
+- The most important facts
+- Important recent developments
+- Relevant citations
+
+Keep the response concise.
+
+Write in the SAME LANGUAGE as the user's question.
+""",
+
+    "deep": """
+Write a DEEP RESEARCH report.
+
+Use clear sections such as:
+
+- What's Happening
+- Background / Context
+- Key Developments
+- Different Perspectives or Disagreement
+- Implications
+
+Translate the section headings into the user's language when appropriate.
+
+Use citations throughout.
+
+Write the entire response in the SAME LANGUAGE as the user's question.
+""",
+
+    "simple": """
+EXPLAIN SIMPLY.
+
+Use:
+- Short sentences
+- Everyday words
+- Simple explanations
+- Relevant examples when supported by the sources
+
+Avoid unnecessary technical jargon.
+
+Write in the SAME LANGUAGE as the user's question.
+""",
+}
+
+
+# ============================================================
+# ERROR HANDLING
+# ============================================================
 
 def _is_temporary_error(error: Exception) -> bool:
     """
-    Identify errors where retrying may help.
-
-    Examples:
-    - 429 RESOURCE_EXHAUSTED
-    - 503 UNAVAILABLE
-    - 500 INTERNAL
-    - 502
-    - 504
+    Check whether an error may be temporary and worth retrying.
     """
 
-    error_text = str(error).upper()
+    message = str(error).upper()
 
-    temporary_errors = [
+    temporary_signals = [
         "429",
         "RESOURCE_EXHAUSTED",
         "503",
@@ -181,26 +191,23 @@ def _is_temporary_error(error: Exception) -> bool:
         "TIMEOUT",
     ]
 
-    return any(code in error_text for code in temporary_errors)
+    return any(
+        signal in message
+        for signal in temporary_signals
+    )
 
 
-# ---------------------------------------------------------
-# Gemini generation with retry
-# ---------------------------------------------------------
+# ============================================================
+# GEMINI GENERATION WITH RETRY
+# ============================================================
 
 def _generate_with_retry(
-    client: genai.Client,
+    client,
     prompt: str,
     max_attempts: int = 3,
 ):
     """
-    Call Gemini with limited exponential-backoff retries.
-
-    Attempt 1 -> immediately
-    Attempt 2 -> wait 2 seconds
-    Attempt 3 -> wait 4 seconds
-
-    This prevents the application from endlessly retrying.
+    Generate a Gemini response with limited retry attempts.
     """
 
     for attempt in range(max_attempts):
@@ -211,9 +218,8 @@ def _generate_with_retry(
                 model=GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
                     temperature=0.4,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
                 ),
             )
 
@@ -221,31 +227,93 @@ def _generate_with_retry(
 
         except Exception as error:
 
-            # Do not retry permanent errors such as
-            # invalid API key, permission denied, bad request, etc.
             if not _is_temporary_error(error):
                 raise
 
-            # Last attempt -> give up
             if attempt == max_attempts - 1:
                 raise
 
-            # Exponential backoff:
-            # attempt 0 -> 2 sec
-            # attempt 1 -> 4 sec
-            delay = 2 ** (attempt + 1)
+            wait_time = 2 ** attempt
 
             print(
                 f"Gemini temporary error. "
-                f"Retrying in {delay} seconds..."
+                f"Retrying in {wait_time} seconds..."
             )
 
-            time.sleep(delay)
+            time.sleep(wait_time)
 
 
-# ---------------------------------------------------------
-# Main research function
-# ---------------------------------------------------------
+# ============================================================
+# RESPONSE PARSER
+# ============================================================
+
+def _parse_response(text: str) -> dict:
+    """
+    Separate the main answer from the follow-up questions.
+    """
+
+    if not text:
+        return {
+            "answer": "",
+            "followups": [],
+        }
+
+    # Normalize whitespace slightly
+    text = text.strip()
+
+    # Find follow-up section
+    marker = "###FOLLOWUPS###"
+
+    if marker in text:
+
+        answer_part, followup_part = text.split(
+            marker,
+            1,
+        )
+
+    else:
+
+        answer_part = text
+        followup_part = ""
+
+    answer = answer_part.strip()
+
+    followups = []
+
+    if followup_part:
+
+        for line in followup_part.splitlines():
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            # Remove numbering:
+            # 1. Question
+            # 2) Question
+            # 3 - Question
+            cleaned = re.sub(
+                r"^\s*\d+\s*[\.\)\-:]\s*",
+                "",
+                line,
+            ).strip()
+
+            if cleaned:
+                followups.append(cleaned)
+
+    # Ensure exactly three follow-ups when possible
+    followups = followups[:3]
+
+    return {
+        "answer": answer,
+        "followups": followups,
+    }
+
+
+# ============================================================
+# MAIN RESEARCH FUNCTION
+# ============================================================
 
 def run_research(
     query: str,
@@ -253,136 +321,114 @@ def run_research(
     sources: list[dict],
 ) -> dict:
     """
-    Send Tavily sources + user query to Gemini.
+    Generate a research answer using Gemini.
 
-    Returns:
-
-    {
-        "analysis": "...",
-        "follow_ups": [...]
-    }
+    Sources are provided by Tavily + the RAG retrieval pipeline.
     """
 
-    # Get Gemini client
     client = _get_client()
 
-    # Prepare Tavily sources
+    # Format retrieved sources
     sources_block = format_sources_block(
         sources,
         MAX_CONTENT_LENGTH,
     )
 
-    # Get requested research mode
     mode_instruction = MODE_INSTRUCTIONS.get(
         mode,
         MODE_INSTRUCTIONS["quick"],
     )
 
-    # Build Gemini prompt
-    user_prompt = f"""
-User question:
+    prompt = f"""
+USER QUESTION:
 {query}
 
-Research mode:
+
+RESEARCH MODE:
+{mode}
+
+
+MODE INSTRUCTIONS:
 {mode_instruction}
 
-Numbered research sources:
+
+RETRIEVED SOURCES:
 {sources_block}
 
-Now analyze the provided research material.
 
-Remember:
+TASK:
+Answer the user's question using ONLY the retrieved sources above.
 
-- Use only the provided sources.
-- Cite important factual claims with [n].
-- Do not invent information.
-- Clearly mention uncertainty or disagreement.
-- Finish with exactly 3 useful follow-up questions.
+Follow the language rules and research rules from the system instructions.
 
-Output the analysis first.
+Cite important factual statements using the source numbers.
 
-Then output:
+Do not invent information.
+
+At the end, output:
 
 ###FOLLOWUPS###
 
-1. ...
-2. ...
-3. ...
+Then exactly 3 short follow-up questions.
 """
 
-    # Call Gemini with retry handling
+    # Generate response
     response = _generate_with_retry(
         client,
-        user_prompt,
+        prompt,
     )
 
-    # Safely extract response text
-    text = getattr(response, "text", None)
+    # --------------------------------------------------------
+    # TEMPORARY DEBUGGING
+    # --------------------------------------------------------
 
-    if not text:
+    try:
+        text = response.text or ""
+
+    except Exception:
+        text = ""
+
+    print("\n==============================")
+    print("RAW GEMINI RESPONSE")
+    print("==============================")
+    print(repr(text))
+
+    # --------------------------------------------------------
+    # EMPTY RESPONSE CHECK
+    # --------------------------------------------------------
+
+    if not text.strip():
         raise RuntimeError(
-            "Gemini returned an empty response. "
-            "Please try the research again."
+            "Gemini returned an empty response."
         )
 
-    return _parse_response(text)
+    # Parse response
+    result = _parse_response(text)
+
+    return result
 
 
-# ---------------------------------------------------------
-# Response parser
-# ---------------------------------------------------------
-
-def _parse_response(text: str) -> dict:
-    """
-    Split Gemini response into:
-
-    analysis
-    follow-up questions
-    """
-
-    parts = re.split(
-        r"###FOLLOWUPS###",
-        text,
-        maxsplit=1,
-    )
-
-    analysis = parts[0].strip()
-
-    follow_ups = []
-
-    if len(parts) > 1:
-
-        for line in parts[1].strip().splitlines():
-
-            cleaned = re.sub(
-                r"^\s*[\d\.\)\-\u2022]+\s*",
-                "",
-                line,
-            ).strip()
-
-            if cleaned:
-                follow_ups.append(cleaned)
-
-    return {
-        "analysis": analysis,
-        "follow_ups": follow_ups[:3],
-    }
-
-
-# ---------------------------------------------------------
-# Simple Gemini connection test
-# ---------------------------------------------------------
+# ============================================================
+# GEMINI CONNECTION TEST
+# ============================================================
 
 def test_gemini() -> str:
     """
-    Simple function for testing whether Gemini is reachable.
+    Simple Gemini API test.
     """
 
     client = _get_client()
 
     response = _generate_with_retry(
         client,
-        "Reply with exactly: Gemini connection successful.",
+        "Explain artificial intelligence in simple words.",
     )
 
-    return response.text.strip()
+    text = response.text or ""
+
+    if not text.strip():
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
+
+    return text

@@ -1,16 +1,14 @@
 """
 AI Orchestrator for NewsLens AI.
 
-Primary AI:
-    Gemini
-
-Fallback AI:
-    Groq
-
 Flow:
     User Query
         ↓
     Tavily Sources
+        ↓
+    RAG Retrieval
+        ↓
+    Relevant Context
         ↓
     Gemini
         ↓
@@ -25,6 +23,7 @@ Flow:
 
 from services.gemini_service import run_research as run_gemini
 from services.groq_service import run_research as run_groq
+from rag.rag_pipeline import run_rag
 
 
 def run_ai_research(
@@ -32,39 +31,61 @@ def run_ai_research(
     mode: str,
     sources: list[dict],
 ) -> dict:
-    """
-    Try Gemini first.
 
-    If Gemini fails, try Groq as a fallback.
+    print("\n==============================")
+    print("AI ORCHESTRATOR")
+    print("==============================")
 
-    Returns:
-        {
-            "analysis": "...",
-            "follow_ups": [...],
-            "provider": "Gemini" or "Groq"
-        }
-    """
+    print("Original Tavily sources:", len(sources))
+    print("Running RAG retrieval...")
 
-    # =====================================================
-    # 1. TRY GEMINI
-    # =====================================================
+    # ---------------------------------
+    # 1. RAG RETRIEVAL
+    # ---------------------------------
 
     try:
-        print("\n==============================")
-        print("AI ORCHESTRATOR")
-        print("==============================")
-        print("Trying Gemini...")
-        print(f"Query: {query}")
-        print(f"Mode: {mode}")
-        print(f"Sources: {len(sources)}")
+
+        relevant_sources = run_rag(
+            query=query,
+            sources=sources,
+            k=5,
+        )
+
+        print(
+            "RAG retrieved sources:",
+            len(relevant_sources),
+        )
+
+    except Exception as rag_error:
+
+        print("\nRAG failed.")
+        print("RAG error:", rag_error)
+
+        # If RAG fails, keep the application usable
+        # by falling back to the original Tavily sources.
+        relevant_sources = sources
+
+        print(
+            "Using original Tavily sources as fallback."
+        )
+
+    # ---------------------------------
+    # 2. GEMINI PRIMARY MODEL
+    # ---------------------------------
+
+    try:
+
+        print("\nTrying Gemini...")
+        raise RuntimeError("TEST: Simulated Gemini failure")
 
         result = run_gemini(
             query=query,
             mode=mode,
-            sources=sources,
+            sources=relevant_sources,
         )
 
         result["provider"] = "Gemini"
+        result["rag_used"] = True
 
         print("Gemini succeeded.")
 
@@ -73,23 +94,24 @@ def run_ai_research(
     except Exception as gemini_error:
 
         print("\nGemini failed.")
-        print(f"Gemini error: {gemini_error}")
+        print("Gemini error:", gemini_error)
 
-    # =====================================================
-    # 2. TRY GROQ
-    # =====================================================
+    # ---------------------------------
+    # 3. GROQ FALLBACK
+    # ---------------------------------
 
     try:
+
         print("\nSwitching to Groq...")
-        print(f"Query: {query}")
 
         result = run_groq(
             query=query,
             mode=mode,
-            sources=sources,
+            sources=relevant_sources,
         )
 
         result["provider"] = "Groq"
+        result["rag_used"] = True
 
         print("Groq succeeded.")
 
@@ -98,11 +120,7 @@ def run_ai_research(
     except Exception as groq_error:
 
         print("\nGroq also failed.")
-        print(f"Groq error: {groq_error}")
-
-        # =================================================
-        # 3. BOTH FAILED
-        # =================================================
+        print("Groq error:", groq_error)
 
         raise RuntimeError(
             "Both AI providers failed.\n\n"
